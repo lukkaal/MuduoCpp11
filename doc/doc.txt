@@ -1,0 +1,121 @@
+MuduoCpp11
+Notes &amp; Code for Muduo using Cpp11 standard
+
+从上到下梳理
+TcpServer
+维护一个 unordered_map 用于记录每个 TcpConnection 类
+1）初始化的时候 传入一个 InetAddress (记录了本服务器需要监听的网卡IP和端口)和 EventLoop (主线程事件循环)
+在初始化过程中 开启了一个 acceptor(Acceptor) 和一个线程池 EventLoopThreadPool, 并为 acceptor 设置了新连接回调函数
+同时设置线程池的数量，并且设置TcpServer当中的 connectionCallback_ 和 messageCallback_ 两个回调函数，也可以设置 ThreadInitCallback
+最后调用 start() 函数，在主线程开启 Acceptor::listen 的同时， 调用线程池的 start 函数开启线程池
+
+2）当监听到一个新的连接的时候(来自 Acceptor)
+Acceptor 执行读回调函数 使用::accept 来获取客户端的 struct sockaddr_in(IP 端口等) 和 返回给服务端的 conn 会执行 TcpServer 中的 newConnection() 
+这个函数会将地址(通过::getsockname(sockfd, (sockaddr *)&local, &addrLen) 获取到的 localAddr 和 从 Acceptor 读回调中获得的 peerAddr)
+以及 ::accept() 返回的 connfd 用来新建一个 TcpConnection，并在 unordered_map 当中记录 同时也将 TcpServer 中的各个回调函数传入到新建的 TcpConnection 中
+从线程池中获取一个 EventLoop 用来绑定 TcpConnection 中 Channel 成员
+最后使用 TcpConnection::connectEstablished 建立连接 
+
+
+TcpConnection
+用于包装一个连接 Channel 和 Socket 类(本质上是为了记录获取到的这个 fd，即 conn)
+1）在这个对象当中包含了有控制 Channel 的各个方法 也记录了许多的回调函数 包括 handleRead & messageCallback_ 两类(但是实际上 handle* 执行过程中是包含有 Callback* 的)
+一个 TcpConnection 的初始化在 Acceptor 的 HandleRead 回调当中 初始化过程中包含了对 成员 Channel 进行 handle* 回调函数的绑定
+然后在主线程 TcpServer 下执行 TcpConnection::connectEstablished 执行 enableReading() 将这个 Channel 加入到 Loop->EpollPoller 
+
+2）在 TcpConnection 当中使用 Buffer 类的缓冲区(有 inputbuffer 用来在 handleRead 中使用/ outputbuffer 在 .send() 中使用) 
+读和写都是先存到 Buffer 当中是因为应用写的快而内核发送数据慢 所以需要把发送数据写入缓冲区 
+
+3）在 shutdown() 和 handleWrite() 是一起出现的，只是在写完的时候关闭连接 /而 connectDestroyed() 则是用来直接从底层 epoll 注销掉 fd 并且关闭连接
+
+
+EventLoopThreadPool
+初始化 EventLoopThreadPool 的时候，本身用于维护开启的各个线程类 EventLoopThread 和 EventLoop，使用 vector 来记录
+1）当 TcpServer 开启的时候， EventLoopThread 调用 start() 会开启 EventLoop 的 startLoop() 获取到这个 EventLoopThread 对应所在的 EventLoop，并维护两个 vector
+这个类的作用本身也是记录并控制各个线程类 EventLoopThread 
+
+
+EventLoopThread
+1）这个类用于维护一个线程类 Thread 和一个函数 threadFunc，初始化时将这个函数绑定给 Thread
+以及一个从 TcpServer-> EventLoopThreadPoo-> EventLoopThread 一路传过来的 ThreadInitCallback
+.startLoop() 本身就是利用 Thread.start() 异步开启一个新的线程 并执行绑定的 threadFunc
+对于 threadFunc 而言，在 TcpServer 启动前绑定了 ThreadInitCallback 的话 threadFunc 当中就会先执行这个 callback，然后新初始化一个 EventLoop 并执行.loop()循环
+
+2）所以.startLoop()就是异步开启子线程(初始化其实是在主线程当中)，返回的 EventLoop 指针被 EventLoopThreadPool 记录
+
+
+EventLoop
+1）事件循环类 初始化的时候维护了一个 ChannelList(vector) 用来记录当前事件循环当中活跃的事件(每次epoll.wait()的返回值，每轮前会清理.clear())
+一个 pendingFunctors(vector) 用来记录其他线程丢到本线程执行的回调函数
+一个 EpollEvent对象(基于 Poller) 
+一个 Channel 类对象 wakeupChannel 用来唤醒这个 EventLoop，绑定的 EventLoop 就是当前的 this 指针
+初始化时候构建 wakeupChannel 对象并且为这个对象绑定 读回调 打开该对象的 可读(enableReading，会将这个 Channel 注册到 Poller)
+
+2）对于 EventLoop 而言，通过在子线程中不断循环执行 epoll 从文件描述符监听到的事件 + 从其他线程传入的回调函数列表 pendingFunctors，完成事件循环
+
+3）但是其他线程只拿到 EventLoop* 指针，又该如何将函数放入到指针所指向的这一块地址呢？(多线程和地址空间)
+使用 .runInLoop(callback) 传入要执行的函数 初始化的时候 在子线程中初始化一个 EventLoop 对象的时候，在对象成员变量当中记录了一个当前的 threadID
+(事实上 早在 EventLoopThread 当中 .startLoop() 时，子线程开启时就已经记录了一份 threadID 到 EventLoopThread->Thread，然后又初始化 EventLoop 又再次把当前线程的 threadID 给放到了 EventLoop 的成员变量当中)
+所以对于每个 EventLoop 来说，通过系统调用将 指针记录的初始化所在线程 与 当前调用该指针所在线程 进行判断是否应当立即执行传入的 callback
+如果不在正确的线程 那么在当前线程执行 .queueLoop()，该函数会对该 EventLoop 的 pendingFunctors 加锁并将该 callback 传入队列
+
+4）传入队列之后，又应该如何让这个 EventLoop* 知道呢？(wakeupChannel 和 wakeup())
+在 EventLoop 中维护的 wakeupChannel 的 wakeupFd 已经被注册到了这个 EventLoop 所构建的 Epoll 当中，所以 Epoll 会监听这个 Channel
+wakeup() 作用正是通过向这个 wakeupFd 进行 write 操作，内部的计数器加1，触发了 wakeupFd 的读事件，从而 epoll_wait() 停止阻塞并开始执行这个 Fd 的读回调函数
+重点：读回调函数只是将内部计数器减1 --> 所以 wakeup() 的重心还是在于使得 epoll_wait() 不再阻塞 但核心还是执行 pendingFunctors 队列中添加的函数
+
+5）总而言之，对于 EventLoop 的主要作用还是执行 .loop() 但是同时也是 Channel 和 Epoll 之间的主管和桥梁: Channel 要注册需要通过 EventLoop，而 Epoll 也被 EventLoop管理，将每次监听到的描述符对应 Channel 返回到 EventLoop 的 activeChannel
+
+
+Channel
+需要传入的参数是 EventLoop* 和一个 fd
+1）记录了该文件描述符 fd 和 关心的事件 event_ 以及 revents_ 表示当前发生的事情，同时还有读/写/关闭/错误的回调函数
+包括如何注册读写等各事件 (enableReading etc;-> 通过 loop* 来注册到 这个 loop* 管理的Epoll) 以及 index_ 表示是否被注册到 Epoll 当中过
+以及函数 handleEvent() 根据此时的 revents_ 的值 来执行相应的回调
+
+2）在 EventLoop 的 activeChannelist 当中 的 .loop 正是对其中的每一个 Channel 执行 handleEvent()(因为此时的 vector 当中都是需要执行回调的 Channel)
+
+EpollPoller:Poller
+1）从功能上描述的话 Epoll的功能主要是
+epoll_create1(EPOLL_CLOEXEC) 创建一个 epoll 返回一个 fd (int)
+epoll_ctl(epollfd_, operation, fd, &event) 对 epoll 监听的文件描述符进行管理 Operation 有 EPOLL_CTL_ADD/ EPOLL_CTL_MOD/ EPOLL_CTL_DEL 返回值为 bool
+epoll_wait(int epollfd, struct epoll_event *events, int maxevents, int timeout) 返回值是活跃的事件个数 timeout是超时时间
+
+2）结构上 
+在 EpollPoller 当中维护了一个 map<int, Channel*> 用来存储所有注册到当前 EpollPoller 的 fd 和其对应的 Channel*
+当 Channel 注册到 EpollPoller 时 本质上调用的就是 EpollPoller::updateChannel 
+而这个函数会调用 epoll_ctl(sys层面) 也会放入 map(维护层面) 
+2.1) epoll_ctl 本身会切换至内核态进行系统调用，将这些参数存放至栈或者寄存器(内核) 以 ADD 为例，epoll 在内核之中维护了一个红黑树和就绪队列，CPU 先查找是否有对应的 fd 在红黑树上，若没有的话会分配这样一个 int fd: struct epitem --> 系统会将这个 fd 和对应的本机服务器端口 (当初 ::accept 系统调用 接受到对端连接然后开启了一个端口 同时系统调用的返回值是一个文件描述符 fd 一路被打包到了 Channel) 的驱动建立回调关系 设备对应端口有对应事件发生的时候会触发硬件中断，然后(调用函数)将 epitem 打包到就绪链表
+即 事件触发后，内核通过注册的回调机制，把对应的红黑树节点（epitem）主动加入就绪列表
+
+struct epitem {
+    struct rb_node rbn;        /* 红黑树节点，用于插入到 eventpoll->rbr */
+    struct list_head rdllink;  /* 就绪链表节点，用于把就绪的 epitem 串到 ready list */
+    struct list_head wtllink;  /* wait 链表节点，用于与 poll/waiter 链接 */
+
+    struct eventpoll *ep;     
+    struct file *fp;    /* fd */
+    uint32_t events;      /*(EPOLLIN/EPOLLOUT/…) */
+    uint32_t revents;     
+};
+
+2.2) 关于结构体 epoll_event: 在实际 event_ctl 的时候 void *ptr 用于指向 Channel 而 uint32_t events 用来指向关心的事件 Channel::event_
+而 epoll_ctl 系统调用也会将用户态的 struct epoll_event 转化为内s核态的 struct epitem 并插入到红黑树中
+
+typedef union epoll_data {
+    void        *ptr;
+    int          fd;
+    uint32_t     u32;
+    uint64_t     u64;
+} epoll_data_t;
+
+struct epoll_event {
+    uint32_t     events;      //EPOLLIN etc./* Epoll events */
+    epoll_data_t data;        //fd /* User data variable */
+};
+
+2.3) epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout) 
+epoll_event *events 会用来接受从内核 epoll 维护的就绪链表中的 epitem->epoll_event，返回值是接收的个数(int)，类似一个缓冲队列
+在 EpollPoller::poll 当中，fillActiveChannels 则是将这个缓冲队列搬到 ChannelList* (属于更高一层的 EventLoop) 
+同时设置每一个获取到的 Channel 的 revents_ 为 注册时的 uint32_t events 然后就可以在 Channel 中执行相应的回调
+
